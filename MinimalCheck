@@ -1,0 +1,9 @@
+docker exec immich_postgres psql -U postgres -d immich -c "
+DELETE FROM asset
+WHERE id IN (
+  SELECT a.id
+  FROM asset a
+  LEFT JOIN asset_file af ON af.\"assetId\" = a.id
+  WHERE af.\"assetId\" IS NULL
+);
+"
