@@ -1,7 +1,6 @@
 #!/bin/bash
-# Kein 'set -e', damit das Script bei kleinen SQL-Fehlern nicht stoppt
 
-echo "=== IMMICH TOTAL CLEANUP (DISK + DB) ==="
+echo "=== IMMICH CLEANUP: DELETE ORPHANED FILES (ON DISK BUT NOT IN DB) ==="
 
 DB_CONTAINER="immich_postgres"
 SERVER_CONTAINER="immich_server"
@@ -9,44 +8,41 @@ DISK_PATH="/mnt/ImageDB"
 TMP_DIR="/tmp/immich_fix"
 mkdir -p "$TMP_DIR"
 
-MISSING_DB="$TMP_DIR/db_paths.txt"
-DELETE_LIST="$TMP_DIR/delete_uuids.txt"
+DB_PATHS="$TMP_DIR/db_paths.txt"
+FS_PATHS="$TMP_DIR/fs_paths.txt"
+ORPHANED="$TMP_DIR/orphaned_files.txt"
 
-echo "[1/3] Identifiziere Dateien zum Löschen..."
-# Wir holen alle Pfade aus der DB
-docker exec "$DB_CONTAINER" psql -U postgres -d immich -t -c "SELECT path FROM asset_file;" | sed '/^\s*$/d' | sort > "$MISSING_DB"
+echo "[1/4] Getting DB paths..."
+docker exec "$DB_CONTAINER" psql -U postgres -d immich -t -c "SELECT path FROM asset_file;" | sed '/^\s*$/d' | sort > "$DB_PATHS"
+echo "DB entries: $(wc -l < "$DB_PATHS")"
 
-# HINWEIS: Da du sagtest, du willst die "falschen" Bilder löschen, 
-# gehen wir davon aus, dass dies die 34k Einträge sind, die keine Zuordnung mehr haben 
-# oder die du bereits als "falsch" markiert hast.
+echo "[2/4] Getting filesystem paths from Immich container..."
+docker exec "$SERVER_CONTAINER" bash -c "find /data/upload -type f 2>/dev/null" | sort > "$FS_PATHS"
+echo "Files on disk: $(wc -l < "$FS_PATHS")"
 
-echo "[2/3] Lösche Dateien physisch von der Festplatte..."
-# Wir wandern durch die Liste und löschen auf der echten Platte
-while read -r path; do
-    # Immich-Pfade in Container (/data/...) zu echten Pfaden (/mnt/ImageDB/...) wandeln
-    real_file=$(echo "$path" | sed "s|^/data/|$DISK_PATH/|")
-    if [ -f "$real_file" ]; then
-        sudo rm "$real_file"
-        echo -n "."
-    fi
-done < "$MISSING_DB"
-echo -e "\nDateien gelöscht."
+echo "[3/4] Finding orphaned files (on disk but NOT in DB)..."
+comm -13 "$DB_PATHS" "$FS_PATHS" > "$ORPHANED"
+ORPHAN_COUNT=$(wc -l < "$ORPHANED")
+echo "Orphaned files to delete: $ORPHAN_COUNT"
 
-echo "[3/3] Bereinige Datenbank-Einträge..."
-# Jetzt holen wir die IDs für diese Pfade
-cat "$MISSING_DB" | xargs -L 100 | while read -r batch; do
-    f=$(echo "$batch" | sed "s/ /','/g; s/^/'/; s/$/'/")
+if [ "$ORPHAN_COUNT" -eq 0 ]; then
+    echo "Nothing to delete."
+    exit 0
+fi
 
-    # IDs holen
-    ids=$(docker exec "$DB_CONTAINER" psql -U postgres -d immich -t -c "SELECT \"assetId\" FROM asset_file WHERE path IN ($f);" | sed '/^\s*$/d')
+echo "[4/4] Deleting $ORPHAN_COUNT orphaned files from disk..."
 
-    if [ ! -z "$ids" ]; then
-        id_batch=$(echo "$ids" | sed "s/ /','/g; s/^/'/; s/$/'/")
-        # Referenzen und Assets löschen (Brute Force)
-        docker exec "$DB_CONTAINER" psql -U postgres -d immich -c "DELETE FROM stack WHERE \"primaryAssetId\" IN ($id_batch);" >/dev/null 2>&1 || true
-        docker exec "$DB_CONTAINER" psql -U postgres -d immich -c "DELETE FROM asset WHERE id IN ($id_batch);" >/dev/null 2>&1 || true
-        echo -n "!"
-    fi
+# Process in batches of 100
+cat "$ORPHANED" | xargs -L 100 | while read -r batch; do
+    # Convert each path in batch to real filesystem path and delete
+    for path in $batch; do
+        real_file=$(echo "$path" | sed "s|^/data/|$DISK_PATH/|")
+        if [ -f "$real_file" ]; then
+            sudo rm "$real_file"
+            echo -n "."
+        fi
+    done
 done
 
-echo -e "\n=== ALLES ERLEDIGT: 80GB SOLLTEN JETZT FREI SEIN ==="
+echo -e "\n=== DONE: $ORPHAN_COUNT files deleted from disk ==="
+echo "No database cleanup needed - these files had no DB entries."
