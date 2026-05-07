@@ -1,5 +1,5 @@
 #!/bin/bash
-
+#DeleteImageFromDBbyERROR.sh
 echo "=== IMMICH CLEANUP: DELETE ALL ORPHANED (DISK + DB) ==="
 
 DB_CONTAINER="immich_postgres"
